@@ -18,11 +18,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/smalibary/pi-native-search.git"
+    "url": "git+https://github.com/yiwenlu66/pi-native-search.git"
   },
-  "homepage": "https://github.com/smalibary/pi-native-search#readme",
+  "homepage": "https://github.com/yiwenlu66/pi-native-search#readme",
   "bugs": {
-    "url": "https://github.com/smalibary/pi-native-search/issues"
+    "url": "https://github.com/yiwenlu66/pi-native-search/issues"
   },
   "engines": {
     "node": ">=20"
@@ -34,8 +34,8 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
   "peerDependenciesMeta": {

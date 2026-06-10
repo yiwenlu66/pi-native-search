@@ -20,13 +20,13 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
   truncateHead,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   Container,
@@ -35,8 +35,8 @@ import {
   Text,
   type SelectItem,
   SelectList,
-} from "@mariozechner/pi-tui";
-import { getSettingsListTheme } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-tui";
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 
 interface SearchConfig {
   enabled: boolean;
@@ -462,9 +462,11 @@ async function openaiSearch(
   query: string,
   model: string,
   apiKey: string,
+  baseUrl = "https://api.openai.com/v1",
   signal?: AbortSignal,
 ): Promise<string> {
-  const res = await fetch("https://api.openai.com/v1/responses", {
+  const url = `${baseUrl.replace(/\/+$/, "")}/responses`;
+  const res = await fetch(url, {
     method: "POST",
     signal,
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -475,7 +477,7 @@ async function openaiSearch(
     }),
   });
   if (!res.ok)
-    throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    throw new Error(`OpenAI Responses ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
   const parts: string[] = [];
   for (const item of data.output || []) {
@@ -756,27 +758,42 @@ async function httpFetch(url: string, signal?: AbortSignal): Promise<string> {
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
+async function getResolvedApiKey(
+  ctx: ExtensionContext,
+  provider: string,
+): Promise<string | undefined> {
+  return (await ctx.modelRegistry.getApiKeyForProvider(provider)) ?? getApiKey(provider);
+}
+
+function isOpenAIResponsesCompatible(ctx: ExtensionContext, provider: string) {
+  return provider === "openai" || ctx.model?.api === "openai-responses";
+}
+
 async function doSearch(
+  ctx: ExtensionContext,
   query: string,
   provider: string,
   model: string,
   baseUrl: string,
   signal?: AbortSignal,
 ): Promise<{ text: string; nativeError?: string }> {
-  const apiKey = getApiKey(provider);
+  const apiKey = await getResolvedApiKey(ctx, provider);
   const cap = PROVIDERS[provider];
+  const isOpenAIResponses = isOpenAIResponsesCompatible(ctx, provider);
+  const hasNativeSearch = !!cap?.nativeSearch || isOpenAIResponses;
   // claude-bridge uses the `claude` CLI's own subscription auth, so it doesn't
   // need an api_key in pi's auth.json.
   const hasAuth = !!apiKey || provider === "claude-bridge";
-  if (cap?.nativeSearch && hasAuth) {
+  if (hasNativeSearch && hasAuth) {
     try {
+      if (isOpenAIResponses) {
+        return { text: await openaiSearch(query, model, apiKey!, baseUrl, signal) };
+      }
       switch (provider) {
         case "zai":
           return { text: await zaiSearch(query, apiKey!, signal) };
         case "google":
           return { text: await googleSearch(query, model, apiKey!, signal) };
-        case "openai":
-          return { text: await openaiSearch(query, model, apiKey!, signal) };
         case "xai":
           return { text: await xaiSearch(query, model, apiKey!, signal) };
         case "anthropic":
@@ -842,8 +859,8 @@ export default function searchExtension(pi: ExtensionAPI) {
       const baseUrl = getCurrentBaseUrl(ctx);
       const cap = PROVIDERS[provider];
       const hasNative =
-        !!cap?.nativeSearch &&
-        (!!getApiKey(provider) || provider === "claude-bridge");
+        (!!cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, provider)) &&
+        (!!(await getResolvedApiKey(ctx, provider)) || provider === "claude-bridge");
       onUpdate?.({
         content: [
           {
@@ -854,6 +871,7 @@ export default function searchExtension(pi: ExtensionAPI) {
       });
       try {
         const { text, nativeError } = await doSearch(
+          ctx,
           params.query,
           provider,
           model,
@@ -1158,10 +1176,10 @@ export default function searchExtension(pi: ExtensionAPI) {
         `Extension: ${config.enabled ? "enabled" : "disabled"}`,
         `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"}`,
         ``,
-        `Provider: ${cap?.name ?? provider ?? "?"} ${hasCredentials(provider ?? "") ? "✓" : "✗"}`,
+        `Provider: ${cap?.name ?? (provider && isOpenAIResponsesCompatible(ctx, provider) ? "OpenAI Responses-compatible" : provider) ?? "?"} ${hasCredentials(provider ?? "") ? "✓" : "✗"}`,
         `Model: ${model || "?"}`,
         `Base URL: ${baseUrl || "?"}`,
-        `Native: ${cap?.nativeSearch ? `yes` : "no"} | Fallback: DuckDuckGo`,
+        `Native: ${cap?.nativeSearch || (provider ? isOpenAIResponsesCompatible(ctx, provider) : false) ? `yes` : "no"} | Fallback: DuckDuckGo`,
       ].join("\n"),
       "info",
     );
@@ -1187,8 +1205,8 @@ export default function searchExtension(pi: ExtensionAPI) {
     const model = getCurrentModel(ctx);
     const cap = p ? PROVIDERS[p] : undefined;
     const m =
-      cap?.nativeSearch && hasCredentials(p ?? "")
-        ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : model || "?"}`
+      p && (cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, p))
+        ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : model || p}`
         : "ddg";
     const fetchBackend =
       cap?.nativeFetch && hasCredentials(p ?? "") && p === "claude-bridge"
