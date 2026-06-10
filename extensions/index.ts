@@ -773,7 +773,12 @@ async function getResolvedApiKey(
 }
 
 function isOpenAIResponsesCompatible(ctx: ExtensionContext, provider: string) {
-  return provider === "openai" || ctx.model?.api === "openai-responses";
+  return (
+    provider === "openai" ||
+    provider === "openai-codex" ||
+    ctx.model?.api === "openai-responses" ||
+    ctx.model?.api === "openai-codex-responses"
+  );
 }
 
 async function doSearch(
