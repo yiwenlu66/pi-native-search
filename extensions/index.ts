@@ -1,7 +1,7 @@
 /**
  * Pi Search Extension
  *
- * Adds web_search and web_fetch tools to pi.
+ * Adds web_search, web_fetch, and image_generate tools to pi.
  * Uses the current provider's native web search API when available
  * (ZAI, Google, OpenAI, xAI, Anthropic), falls back to DuckDuckGo otherwise.
  * ZAI search uses the Web Search Prime MCP endpoint (included in
@@ -16,7 +16,7 @@
  * Config persists in ~/.pi/agent/search-config.json
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
@@ -42,6 +42,7 @@ interface SearchConfig {
   enabled: boolean;
   searchEnabled: boolean;
   fetchEnabled: boolean;
+  imageEnabled: boolean;
   providerOverrides: Record<
     string,
     { searchEnabled?: boolean; fetchEnabled?: boolean }
@@ -191,17 +192,23 @@ function getConfigPath() {
   return join(getAgentDir(), "search-config.json");
 }
 
-function loadConfig(): SearchConfig {
-  try {
-    const path = getConfigPath();
-    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {}
+function defaultConfig(): SearchConfig {
   return {
     enabled: true,
     searchEnabled: true,
     fetchEnabled: true,
+    imageEnabled: true,
     providerOverrides: {},
   };
+}
+
+function loadConfig(): SearchConfig {
+  const defaults = defaultConfig();
+  try {
+    const path = getConfigPath();
+    if (existsSync(path)) return { ...defaults, ...JSON.parse(readFileSync(path, "utf-8")) };
+  } catch {}
+  return defaults;
 }
 
 function saveConfig(config: SearchConfig) {
@@ -810,6 +817,106 @@ async function doSearch(
   return { text: await ddgSearch(query, signal) };
 }
 
+// ─── OpenAI Responses Image Generation ───────────────────────────────────────
+
+interface ImageGenerateParams {
+  prompt: string;
+  referenceImages?: string[];
+  outputPath?: string;
+  action?: "auto" | "generate" | "edit";
+  size?: "auto" | "1024x1024" | "1024x1536" | "1536x1024";
+  quality?: "low" | "medium" | "high" | "auto";
+  outputFormat?: "png" | "webp" | "jpeg";
+  inputFidelity?: "low" | "high";
+  imageModel?: string;
+}
+
+function mimeFromPath(path: string) {
+  const ext = extname(path).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
+}
+
+function imageUrlFromReference(reference: string, cwd: string) {
+  if (/^(https?:|data:)/i.test(reference)) return reference;
+  const path = isAbsolute(reference) ? reference : resolve(cwd, reference);
+  const bytes = readFileSync(path);
+  return `data:${mimeFromPath(path)};base64,${bytes.toString("base64")}`;
+}
+
+function defaultImageOutputPath(cwd: string, format: string) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(cwd, `generated-image-${stamp}.${format === "jpeg" ? "jpg" : format}`);
+}
+
+function extractImageResult(data: any): string | undefined {
+  for (const item of data.output || []) {
+    if (item.type === "image_generation_call" && item.result) return item.result;
+  }
+  return undefined;
+}
+
+async function generateImage(
+  ctx: ExtensionContext,
+  params: ImageGenerateParams,
+  signal?: AbortSignal,
+): Promise<{ path: string; revisedPrompt?: string }> {
+  const provider = getCurrentProvider(ctx) ?? "";
+  if (!isOpenAIResponsesCompatible(ctx, provider)) {
+    throw new Error(`Provider ${provider || "?"} is not OpenAI Responses-compatible`);
+  }
+  const apiKey = await getResolvedApiKey(ctx, provider);
+  if (!apiKey) throw new Error(`No API key configured for provider ${provider}`);
+
+  const outputFormat = params.outputFormat ?? "png";
+  const outputPath = params.outputPath
+    ? isAbsolute(params.outputPath)
+      ? params.outputPath
+      : resolve(ctx.cwd, params.outputPath)
+    : defaultImageOutputPath(ctx.cwd, outputFormat);
+  const content: any[] = [{ type: "input_text", text: params.prompt }];
+  for (const reference of params.referenceImages ?? []) {
+    content.push({
+      type: "input_image",
+      image_url: imageUrlFromReference(reference, ctx.cwd),
+      detail: "auto",
+    });
+  }
+
+  const tool: any = {
+    type: "image_generation",
+    action: params.action ?? "auto",
+    size: params.size ?? "auto",
+    quality: params.quality ?? "auto",
+    output_format: outputFormat,
+  };
+  if (params.inputFidelity) tool.input_fidelity = params.inputFidelity;
+  if (params.imageModel) tool.model = params.imageModel;
+
+  const res = await fetch(`${getCurrentBaseUrl(ctx).replace(/\/+$/, "")}/responses`, {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: getCurrentModel(ctx),
+      input: [{ role: "user", content }],
+      tools: [tool],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI Responses image ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  }
+  const data = await res.json();
+  const imageBase64 = extractImageResult(data);
+  if (!imageBase64) throw new Error("No image_generation_call result found in response");
+
+  mkdirSync(dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, Buffer.from(imageBase64, "base64"));
+  return { path: outputPath };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function getCurrentProvider(ctx: ExtensionContext) {
@@ -830,6 +937,11 @@ function isFetchAvailable(ctx: ExtensionContext, config: SearchConfig) {
   if (!config.enabled || !config.fetchEnabled) return false;
   const p = getCurrentProvider(ctx);
   return p ? config.providerOverrides[p]?.fetchEnabled !== false : false;
+}
+function isImageAvailable(ctx: ExtensionContext, config: SearchConfig) {
+  if (!config.enabled || !config.imageEnabled) return false;
+  const p = getCurrentProvider(ctx);
+  return p ? isOpenAIResponsesCompatible(ctx, p) : false;
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
@@ -992,10 +1104,87 @@ export default function searchExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "image_generate",
+    label: "Image Generate",
+    description:
+      "Generate or edit an image using OpenAI Responses native image_generation. Supports local paths, data URLs, or HTTP URLs as referenceImages.",
+    parameters: Type.Object({
+      prompt: Type.String({ description: "Image prompt or edit instruction" }),
+      referenceImages: Type.Optional(
+        Type.Array(Type.String({ description: "Local image path, image URL, or data URL" })),
+      ),
+      outputPath: Type.Optional(Type.String({ description: "Where to save the generated image" })),
+      action: Type.Optional(Type.String({ description: "auto, generate, or edit" })),
+      size: Type.Optional(Type.String({ description: "auto, 1024x1024, 1024x1536, or 1536x1024" })),
+      quality: Type.Optional(Type.String({ description: "low, medium, high, or auto" })),
+      outputFormat: Type.Optional(Type.String({ description: "png, webp, or jpeg" })),
+      inputFidelity: Type.Optional(Type.String({ description: "low or high" })),
+      imageModel: Type.Optional(Type.String({ description: "Optional image model override" })),
+    }),
+    async execute(_id, params, signal, onUpdate, ctx) {
+      if (!isImageAvailable(ctx, config)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Image generation disabled or current provider is not OpenAI Responses-compatible.",
+            },
+          ],
+          details: { error: "disabled" },
+        };
+      }
+      onUpdate?.({
+        content: [
+          {
+            type: "text" as const,
+            text: `Generating image with ${getCurrentProvider(ctx)}/${getCurrentModel(ctx)}...`,
+          },
+        ],
+      });
+      try {
+        const result = await generateImage(ctx, params as ImageGenerateParams, signal);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Generated image saved to ${result.path}`,
+            },
+          ],
+          details: {
+            path: result.path,
+            provider: getCurrentProvider(ctx),
+            model: getCurrentModel(ctx),
+            references: (params.referenceImages ?? []).length,
+          },
+        };
+      } catch (err: any) {
+        if (signal?.aborted)
+          return { content: [{ type: "text" as const, text: "Cancelled." }] };
+        return {
+          content: [{ type: "text" as const, text: `Error: ${err.message}` }],
+          isError: true,
+        };
+      }
+    },
+    renderCall(a, t) {
+      return new Text(
+        t.fg("toolTitle", t.bold("image_generate ")) +
+          t.fg("muted", `"${a.prompt}"`),
+        0,
+        0,
+      );
+    },
+    renderResult(r, { isPartial }, t) {
+      if (isPartial) return new Text(t.fg("warning", "Generating image..."), 0, 0);
+      return new Text(r.isError ? t.fg("error", "Image generation failed") : t.fg("success", "Generated image"), 0, 0);
+    },
+  });
+
   // ─── Commands ───────────────────────────────────────────────────────────
 
   pi.registerCommand("search", {
-    description: "Configure web search & fetch tools",
+    description: "Configure web search, fetch, and image tools",
     getArgumentCompletions(p) {
       return ["on", "off", "providers", "config"]
         .filter((c) => c.startsWith(p))
@@ -1015,8 +1204,9 @@ export default function searchExtension(pi: ExtensionAPI) {
         config.enabled = true;
         config.searchEnabled = true;
         config.fetchEnabled = true;
+        config.imageEnabled = true;
         saveConfig(config);
-        pi.setActiveTools([...pi.getActiveTools(), "web_search", "web_fetch"]);
+        pi.setActiveTools([...pi.getActiveTools(), "web_search", "web_fetch", "image_generate"]);
         ctx.ui.notify("Search enabled", "info");
         return;
       }
@@ -1024,7 +1214,7 @@ export default function searchExtension(pi: ExtensionAPI) {
         config.enabled = false;
         saveConfig(config);
         pi.setActiveTools(
-          pi.getActiveTools().filter((t) => t !== "web_search" && t !== "web_fetch"),
+          pi.getActiveTools().filter((t) => t !== "web_search" && t !== "web_fetch" && t !== "image_generate"),
         );
         ctx.ui.notify("Search disabled", "info");
         return;
@@ -1054,6 +1244,12 @@ export default function searchExtension(pi: ExtensionAPI) {
           id: "fetch",
           label: "Web Fetch",
           currentValue: config.fetchEnabled ? "enabled" : "disabled",
+          values: ["enabled", "disabled"],
+        },
+        {
+          id: "image",
+          label: "Image Generation",
+          currentValue: config.imageEnabled ? "enabled" : "disabled",
           values: ["enabled", "disabled"],
         },
       ];
@@ -1093,6 +1289,7 @@ export default function searchExtension(pi: ExtensionAPI) {
           if (id === "enabled") config.enabled = val === "enabled";
           else if (id === "search") config.searchEnabled = val === "enabled";
           else if (id === "fetch") config.fetchEnabled = val === "enabled";
+          else if (id === "image") config.imageEnabled = val === "enabled";
           else if (id.startsWith("provider:")) {
             const pid = id.split(":")[1]!;
             if (!config.providerOverrides[pid]) config.providerOverrides[pid] = {};
@@ -1174,7 +1371,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     ctx.ui.notify(
       [
         `Extension: ${config.enabled ? "enabled" : "disabled"}`,
-        `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"}`,
+        `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"} | Image: ${config.imageEnabled ? "enabled" : "disabled"}`,
         ``,
         `Provider: ${cap?.name ?? (provider && isOpenAIResponsesCompatible(ctx, provider) ? "OpenAI Responses-compatible" : provider) ?? "?"} ${hasCredentials(provider ?? "") ? "✓" : "✗"}`,
         `Model: ${model || "?"}`,
@@ -1190,9 +1387,10 @@ export default function searchExtension(pi: ExtensionAPI) {
   function applyToolsConfig(ctx: ExtensionContext) {
     const a = pi
       .getActiveTools()
-      .filter((t) => t !== "web_search" && t !== "web_fetch");
+      .filter((t) => t !== "web_search" && t !== "web_fetch" && t !== "image_generate");
     if (config.enabled && isSearchAvailable(ctx, config)) a.push("web_search");
     if (config.enabled && isFetchAvailable(ctx, config)) a.push("web_fetch");
+    if (config.enabled && isImageAvailable(ctx, config)) a.push("image_generate");
     pi.setActiveTools(a);
   }
 
@@ -1215,6 +1413,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     const parts: string[] = [];
     if (config.searchEnabled) parts.push(`search:${m}`);
     if (config.fetchEnabled) parts.push(fetchBackend);
+    if (config.imageEnabled && p && isOpenAIResponsesCompatible(ctx, p)) parts.push("image:native");
     ctx.ui.setStatus(
       "search",
       parts.length
