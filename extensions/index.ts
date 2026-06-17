@@ -781,6 +781,13 @@ function isOpenAIResponsesCompatible(ctx: ExtensionContext, provider: string) {
   );
 }
 
+function isAnthropicCompatible(ctx: ExtensionContext, provider: string) {
+  return (
+    provider === "anthropic" ||
+    (ctx.model as any)?.api === "anthropic-messages"
+  );
+}
+
 async function doSearch(
   ctx: ExtensionContext,
   query: string,
@@ -792,7 +799,8 @@ async function doSearch(
   const apiKey = await getResolvedApiKey(ctx, provider);
   const cap = PROVIDERS[provider];
   const isOpenAIResponses = isOpenAIResponsesCompatible(ctx, provider);
-  const hasNativeSearch = !!cap?.nativeSearch || isOpenAIResponses;
+  const isAnthropic = isAnthropicCompatible(ctx, provider);
+  const hasNativeSearch = !!cap?.nativeSearch || isOpenAIResponses || isAnthropic;
   // claude-bridge uses the `claude` CLI's own subscription auth, so it doesn't
   // need an api_key in pi's auth.json.
   const hasAuth = !!apiKey || provider === "claude-bridge";
@@ -800,6 +808,12 @@ async function doSearch(
     try {
       if (isOpenAIResponses) {
         return { text: await openaiSearch(query, model, apiKey!, baseUrl, signal) };
+      }
+      if (isAnthropic && provider !== "anthropic") {
+        // Custom provider using anthropic-messages API (e.g. proxy)
+        return {
+          text: await anthropicSearch(query, model, apiKey!, baseUrl, signal),
+        };
       }
       switch (provider) {
         case "zai":
@@ -976,7 +990,7 @@ export default function searchExtension(pi: ExtensionAPI) {
       const baseUrl = getCurrentBaseUrl(ctx);
       const cap = PROVIDERS[provider];
       const hasNative =
-        (!!cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, provider)) &&
+        (!!cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, provider) || isAnthropicCompatible(ctx, provider)) &&
         (!!(await getResolvedApiKey(ctx, provider)) || provider === "claude-bridge");
       onUpdate?.({
         content: [
@@ -1408,7 +1422,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     const model = getCurrentModel(ctx);
     const cap = p ? PROVIDERS[p] : undefined;
     const m =
-      p && (cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, p))
+      p && (cap?.nativeSearch || isOpenAIResponsesCompatible(ctx, p) || isAnthropicCompatible(ctx, p))
         ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : model || p}`
         : "ddg";
     const fetchBackend =
