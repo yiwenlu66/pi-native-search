@@ -877,6 +877,199 @@ function extractImageResult(data: any): string | undefined {
   return undefined;
 }
 
+function extractImageResultDeep(data: any): string | undefined {
+  const stack = [data];
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item) continue;
+    if (Array.isArray(item)) {
+      stack.push(...item);
+      continue;
+    }
+    if (typeof item !== "object") continue;
+    if (item.type === "image_generation_call" && typeof item.result === "string") {
+      return item.result;
+    }
+    stack.push(...Object.values(item));
+  }
+  return undefined;
+}
+
+function codexBase64UrlDecode(data: string) {
+  const normalized = data.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+  return Buffer.from(padded, "base64").toString("utf-8");
+}
+
+function extractCodexAccountId(token: string) {
+  try {
+    const [, payload] = token.split(".");
+    if (!payload) throw new Error("missing JWT payload");
+    const claims = JSON.parse(codexBase64UrlDecode(payload));
+    const accountId = claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+    if (!accountId) throw new Error("missing chatgpt_account_id claim");
+    return accountId as string;
+  } catch {
+    throw new Error("Failed to extract OpenAI Codex account ID from OAuth token");
+  }
+}
+
+function resolveCodexResponsesUrl(baseUrl: string) {
+  const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : "https://chatgpt.com/backend-api";
+  const normalized = raw.replace(/\/+$/, "");
+  if (normalized.endsWith("/codex/responses")) return normalized;
+  if (normalized.endsWith("/codex")) return `${normalized}/responses`;
+  return `${normalized}/codex/responses`;
+}
+
+async function extractCodexImageResult(res: Response): Promise<string | undefined> {
+  if (!res.body) return undefined;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let splitAt = buffer.indexOf("\n\n");
+      while (splitAt !== -1) {
+        const event = buffer.slice(0, splitAt);
+        buffer = buffer.slice(splitAt + 2);
+        const data = event
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim())
+          .join("\n")
+          .trim();
+        if (data && data !== "[DONE]") {
+          const parsed = JSON.parse(data);
+          if (parsed.type === "error") {
+            throw new Error(`OpenAI Codex image error: ${parsed.message || JSON.stringify(parsed)}`);
+          }
+          if (parsed.type === "response.failed") {
+            const message = parsed.response?.error?.message || JSON.stringify(parsed.response?.error ?? parsed);
+            throw new Error(`OpenAI Codex image failed: ${message}`);
+          }
+          const imageBase64 = extractImageResultDeep(parsed);
+          if (imageBase64) return imageBase64;
+        }
+        splitAt = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+  return undefined;
+}
+
+function isOpenAICodexCompatible(ctx: ExtensionContext, provider: string) {
+  return provider === "openai-codex" || ctx.model?.api === "openai-codex-responses";
+}
+
+function buildImageInputContent(params: ImageGenerateParams, cwd: string) {
+  const content: any[] = [{ type: "input_text", text: params.prompt }];
+  for (const reference of params.referenceImages ?? []) {
+    content.push({
+      type: "input_image",
+      image_url: imageUrlFromReference(reference, cwd),
+      detail: "auto",
+    });
+  }
+  return content;
+}
+
+function buildImageGenerationTool(params: ImageGenerateParams, outputFormat: string) {
+  const tool: any = {
+    type: "image_generation",
+    action: params.action ?? "auto",
+    size: params.size ?? "auto",
+    quality: params.quality ?? "auto",
+    output_format: outputFormat,
+  };
+  if (params.inputFidelity) tool.input_fidelity = params.inputFidelity;
+  if (params.imageModel) tool.model = params.imageModel;
+  return tool;
+}
+
+async function generateStandardOpenAIImage(
+  ctx: ExtensionContext,
+  params: ImageGenerateParams,
+  apiKey: string,
+  outputFormat: string,
+  outputPath: string,
+  signal?: AbortSignal,
+): Promise<{ path: string; revisedPrompt?: string }> {
+  const res = await fetch(`${getCurrentBaseUrl(ctx).replace(/\/+$/, "")}/responses`, {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: getCurrentModel(ctx),
+      input: [{ role: "user", content: buildImageInputContent(params, ctx.cwd) }],
+      tools: [buildImageGenerationTool(params, outputFormat)],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI Responses image ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  }
+  const data = await res.json();
+  const imageBase64 = extractImageResult(data);
+  if (!imageBase64) throw new Error("No image_generation_call result found in response");
+
+  mkdirSync(dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, Buffer.from(imageBase64, "base64"));
+  return { path: outputPath };
+}
+
+async function generateCodexImage(
+  ctx: ExtensionContext,
+  params: ImageGenerateParams,
+  apiKey: string,
+  outputFormat: string,
+  outputPath: string,
+  signal?: AbortSignal,
+): Promise<{ path: string; revisedPrompt?: string }> {
+  const accountId = extractCodexAccountId(apiKey);
+  const res = await fetch(resolveCodexResponsesUrl(getCurrentBaseUrl(ctx)), {
+    method: "POST",
+    signal,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "chatgpt-account-id": accountId,
+      originator: "pi",
+      "User-Agent": "pi",
+      "OpenAI-Beta": "responses=experimental",
+      accept: "text/event-stream",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: getCurrentModel(ctx),
+      store: false,
+      stream: true,
+      instructions: "Generate the requested image.",
+      input: [{ role: "user", content: buildImageInputContent(params, ctx.cwd) }],
+      tools: [buildImageGenerationTool(params, outputFormat)],
+      tool_choice: "auto",
+      parallel_tool_calls: true,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`OpenAI Codex image ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  }
+  const imageBase64 = await extractCodexImageResult(res);
+  if (!imageBase64) throw new Error("No image_generation_call result found in Codex response");
+
+  mkdirSync(dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, Buffer.from(imageBase64, "base64"));
+  return { path: outputPath };
+}
+
 async function generateImage(
   ctx: ExtensionContext,
   params: ImageGenerateParams,
@@ -895,45 +1088,10 @@ async function generateImage(
       ? params.outputPath
       : resolve(ctx.cwd, params.outputPath)
     : defaultImageOutputPath(ctx.cwd, outputFormat);
-  const content: any[] = [{ type: "input_text", text: params.prompt }];
-  for (const reference of params.referenceImages ?? []) {
-    content.push({
-      type: "input_image",
-      image_url: imageUrlFromReference(reference, ctx.cwd),
-      detail: "auto",
-    });
-  }
 
-  const tool: any = {
-    type: "image_generation",
-    action: params.action ?? "auto",
-    size: params.size ?? "auto",
-    quality: params.quality ?? "auto",
-    output_format: outputFormat,
-  };
-  if (params.inputFidelity) tool.input_fidelity = params.inputFidelity;
-  if (params.imageModel) tool.model = params.imageModel;
-
-  const res = await fetch(`${getCurrentBaseUrl(ctx).replace(/\/+$/, "")}/responses`, {
-    method: "POST",
-    signal,
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: getCurrentModel(ctx),
-      input: [{ role: "user", content }],
-      tools: [tool],
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`OpenAI Responses image ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  }
-  const data = await res.json();
-  const imageBase64 = extractImageResult(data);
-  if (!imageBase64) throw new Error("No image_generation_call result found in response");
-
-  mkdirSync(dirname(outputPath), { recursive: true });
-  writeFileSync(outputPath, Buffer.from(imageBase64, "base64"));
-  return { path: outputPath };
+  return isOpenAICodexCompatible(ctx, provider)
+    ? generateCodexImage(ctx, params, apiKey, outputFormat, outputPath, signal)
+    : generateStandardOpenAIImage(ctx, params, apiKey, outputFormat, outputPath, signal);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

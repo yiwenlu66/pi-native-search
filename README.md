@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/pi-native-search)](https://www.npmjs.com/package/pi-native-search)
 [![license](https://img.shields.io/npm/l/pi-native-search)](LICENSE)
 
-A [pi](https://github.com/badlogic/pi-mono) extension that adds `web_search` and `web_fetch` tools, routing each call through the **active provider's own native search backend** when available, and falling back to DuckDuckGo HTML scraping otherwise.
+A [pi](https://github.com/badlogic/pi-mono) extension that adds `web_search`, `web_fetch`, and `image_generate` tools. Search routes each call through the **active provider's own native search backend** when available, and falls back to DuckDuckGo HTML scraping otherwise. Image generation uses OpenAI Responses-compatible providers, including the ChatGPT Codex OAuth backend for `openai-codex`.
 
 The headline feature: when you're using your **Claude Code subscription via [pi-claude-bridge](https://www.npmjs.com/package/pi-claude-bridge)**, search and fetch are delegated to Claude Code's actual `WebSearch` and `WebFetch` tools — the same ones you get in Zed, Claude Desktop, or the Claude Code CLI. No separate API key required.
 
@@ -33,10 +33,11 @@ The extension auto-detects your active provider via pi's `ctx.model.provider` an
 
 ## Usage
 
-Once installed, two tools become available to the model:
+Once installed, three tools become available to the model:
 
 - `web_search { query }` — searches the web and returns ranked results.
 - `web_fetch { url }` — fetches and returns a page's text content (truncated to 50 KB / 2000 lines).
+- `image_generate { prompt, ... }` — generates or edits images through OpenAI Responses image generation. With `openai-codex`, the extension uses the Codex OAuth endpoint (`/backend-api/codex/responses`) and required Codex headers instead of the standard `/v1/responses` API-key path.
 
 The model decides when to use them; you don't need to do anything else. To configure or inspect the extension, use the `/search` slash command:
 
