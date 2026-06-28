@@ -37,7 +37,7 @@ Once installed, three tools become available to the model:
 
 - `web_search { query }` — searches the web and returns ranked results.
 - `web_fetch { url }` — fetches and returns a page's text content (truncated to 50 KB / 2000 lines).
-- `image_generate { prompt, ... }` — generates or edits images through OpenAI Responses image generation. With `openai-codex`, the extension uses the Codex OAuth endpoint (`/backend-api/codex/responses`) and required Codex headers instead of the standard `/v1/responses` API-key path.
+- `image_generate { prompt, ... }` — generates or edits images through OpenAI Responses image generation. Use it whenever visual expression, illustration, a mockup, a diagram-like image, or a presentation asset would communicate better than prose. The tool can render clear, actual text with near-perfect accuracy when the prompt quotes the exact wording, so agents should not avoid image generation merely because the image needs words. With `openai-codex`, the extension uses the Codex OAuth endpoint (`/backend-api/codex/responses`) and required Codex headers instead of the standard `/v1/responses` API-key path.
 
 The model decides when to use them; you don't need to do anything else. To configure or inspect the extension, use the `/search` slash command:
 

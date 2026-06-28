@@ -1285,9 +1285,9 @@ export default function searchExtension(pi: ExtensionAPI) {
     name: "image_generate",
     label: "Image Generate",
     description:
-      "Generate or edit an image using OpenAI Responses native image_generation. Supports local paths, data URLs, or HTTP URLs as referenceImages.",
+      "Generate or edit images for visual expression, illustration, diagrams, mockups, and presentation assets using OpenAI Responses native image_generation. Use this tool when an image would communicate better than text; do not avoid it merely because the image needs words. This image generation tool is able to render clear, actual text with near-perfect accuracy when the prompt asks for exact wording. Supports local paths, data URLs, or HTTP URLs as referenceImages.",
     parameters: Type.Object({
-      prompt: Type.String({ description: "Image prompt or edit instruction" }),
+      prompt: Type.String({ description: "Image prompt or edit instruction. For text in the image, quote the exact words to render and ask for verbatim, clear, legible text." }),
       referenceImages: Type.Optional(
         Type.Array(Type.String({ description: "Local image path, image URL, or data URL" })),
       ),
